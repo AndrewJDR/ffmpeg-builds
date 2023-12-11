@@ -1,11 +1,12 @@
 name: Test Full Build
 on:
-  pull_request:
-    branches:
-      - master
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE'
+  push:
+# pull_request:
+#   branches:
+#     - release/5.1
+#   paths-ignore:
+#     - '**.md'
+#     - 'LICENSE'
 
 env:
   DOCKER_BUILDKIT: 1
@@ -17,18 +18,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [win64,linux64,linuxarm64]
-        variant: [lgpl,gpl 6.0,gpl 5.1,lgpl 6.0,lgpl 5.1,gpl-shared,lgpl-shared,gpl-shared 6.0,gpl-shared 5.1,lgpl-shared 6.0,lgpl-shared 5.1]
+        target: [win64,linux64]
+        variant: [gpl 5.1]
         quickbuild: [1]
         include:
           - target: win64
-            variant: gpl
+            variant: gpl 5.1
             quickbuild: ''
           - target: linux64
-            variant: gpl
-            quickbuild: ''
-          - target: linuxarm64
-            variant: gpl
+            variant: gpl 5.1
             quickbuild: ''
     steps:
       - name: Free Disk-Space
