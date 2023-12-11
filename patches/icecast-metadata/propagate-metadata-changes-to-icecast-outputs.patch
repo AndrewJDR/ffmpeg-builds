@@ -1,0 +1,188 @@
+diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c
+index e7384f052a..ba89270092 100644
+--- a/fftools/ffmpeg.c
++++ b/fftools/ffmpeg.c
+@@ -4341,6 +4341,15 @@ static int transcode(void)
+         av_log(NULL, AV_LOG_INFO, "Press [q] to stop, [?] for help\n");
+     }
+ 
++    // check if metadata propagation is required
++    int propagate_metadata_updates = 0;
++    for (i = 0; i < nb_output_files; i++) {
++        if (strncmp(output_files[i]->ctx->url, "icecast://", 10) == 0) {
++            propagate_metadata_updates = 1;
++            break;
++        }
++    }
++
+     timer_start = av_gettime_relative();
+ 
+ #if HAVE_THREADS
+@@ -4370,6 +4379,18 @@ static int transcode(void)
+ 
+         /* dump report by using the output first video and audio streams */
+         print_report(0, timer_start, cur_time);
++
++        for (i = 0; i < nb_input_streams && propagate_metadata_updates; i++) {
++            ist = input_streams[i];
++            if (input_files[ist->file_index]->ctx->event_flags & AVFMT_EVENT_FLAG_METADATA_UPDATED) {
++                input_files[ist->file_index]->ctx->event_flags &= ~AVFMT_EVENT_FLAG_METADATA_UPDATED;
++                av_log(NULL, AV_LOG_TRACE, "Input metadata update detected on stream: %d\n", ist->file_index);
++                for (i = 0; i < nb_output_files; i++) {
++                    av_dict_copy(&output_files[i]->ctx->metadata, input_files[ist->file_index]->ctx->metadata, 0);
++                    output_files[i]->ctx->event_flags |= AVFMT_EVENT_FLAG_METADATA_UPDATED;
++                }
++            }
++        }
+     }
+ #if HAVE_THREADS
+     free_input_threads();
+diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
+index 6e18a4a23e..c0ca635fda 100644
+--- a/fftools/ffmpeg_opt.c
++++ b/fftools/ffmpeg_opt.c
+@@ -33,6 +33,7 @@
+ #include "opt_common.h"
+ 
+ #include "libavformat/avformat.h"
++#include "libavformat/url.h"
+ 
+ #include "libavcodec/avcodec.h"
+ #include "libavcodec/bsf.h"
+@@ -2845,6 +2846,11 @@ loop_end:
+             print_error(filename, err);
+             exit_program(1);
+         }
++        // set the AVFormatContext parent reference in URLContext
++        if (strncmp(oc->url, "icecast://", 10) == 0) {
++            av_log(NULL, AV_LOG_TRACE, "Set AVFormatContext parent reference in URLContext\n");
++            ((URLContext *)oc->pb->opaque)->ctx = oc;
++        }
+     } else if (strcmp(oc->oformat->name, "image2")==0 && !av_filename_number_test(filename))
+         assert_file_overwrite(filename);
+ 
+diff --git a/libavformat/icecast.c b/libavformat/icecast.c
+index b06c53cabd..2524688255 100644
+--- a/libavformat/icecast.c
++++ b/libavformat/icecast.c
+@@ -33,6 +33,7 @@ typedef struct IcecastContext {
+     URLContext *hd;
+     int send_started;
+     char *user;
++    char *metadata_url;
+     // Options
+     char *content_type;
+     char *description;
+@@ -163,6 +164,12 @@ static int icecast_open(URLContext *h, const char *uri, int flags)
+         goto cleanup;
+     }
+ 
++    // Build URI for metadata updates
++    ff_url_join(h_url, sizeof(h_url),
++                s->tls ? "https" : "http",
++                auth, host, port, "/admin/metadata?mode=updinfo&charset=UTF-8&mount=%s", path);
++    s->metadata_url = av_strdup(h_url);
++
+     // Build new URI for passing to http protocol
+     ff_url_join(h_url, sizeof(h_url),
+                 s->tls ? "https" : "http",
+@@ -178,6 +185,65 @@ cleanup:
+     return ret;
+ }
+ 
++static int metadata_update_interrupt_cb(void *ctx) {
++    return 0;
++}
++
++const AVIOInterruptCB icecast_metadata_int_cb = { metadata_update_interrupt_cb, NULL };
++
++// escape the song name (like bprint_escaped_path but also escapes '&' and '#')
++static void escape_metadata(char *buffer, int size, const char *song) {
++#define NEEDS_ESCAPE(ch) \
++    ((ch) <= ' ' || (ch) >= '\x7f' || \
++     (ch) == '"' || (ch) == '%' || (ch) == '<' || (ch) == '>' || (ch) == '\\' || \
++     (ch) == '^' || (ch) == '`' || (ch) == '{' || (ch) == '}' || (ch) == '|' || \
++     (ch) == '&' || (ch) == '#')
++    char *q = buffer;
++    while (*song && q - buffer < size - 4) {
++        if (song[0] == '%' && av_isxdigit(song[1]) && av_isxdigit(song[2])) {
++            *q++ = *song++;
++            *q++ = *song++;
++            *q++ = *song++;
++        } else if (NEEDS_ESCAPE(*song)) {
++            q += snprintf(q, 4, "%%%02X", (uint8_t)*song++);
++        } else {
++            *q++ = *song++;
++        }
++    }
++    // terminate the string
++    if (q - buffer < size) {
++        *q = '\0';
++    } else {
++        buffer[size - 1] = '\0';
++    }
++}
++
++static void update_metadata(IcecastContext *s, const char *song) {
++    // escape the song name
++    char escaped_song[1024];
++    escape_metadata(&escaped_song, sizeof(escaped_song), song);
++
++    // build the metadata update url
++    char h_url[2048];
++    snprintf(h_url, sizeof(h_url), "%s&song=%s", s->metadata_url, &escaped_song);
++    av_log(s, AV_LOG_TRACE, "StreamTitle update: '%s', url: '%s'\n", song, h_url);
++
++    // call the metadata update url
++    AVDictionary *opt_dict = NULL;
++    av_dict_set(&opt_dict, "auth_type", "basic", 0);
++    if (NOT_EMPTY(s->user_agent))
++        av_dict_set(&opt_dict, "user_agent", s->user_agent, 0);
++    AVIOContext *avio = NULL;
++    int ret = avio_open2(&avio, h_url, AVIO_FLAG_READ, &icecast_metadata_int_cb, &opt_dict);
++    if (ret < 0) {
++        av_log(NULL, AV_LOG_WARNING, "Failed to open metadata update URL \"%s\": %s\n", h_url, av_err2str(ret));
++    }
++    if ((ret = avio_closep(&avio)) < 0) {
++        av_log(NULL, AV_LOG_ERROR, "Error closing metadata update URL \"%s\": %s\n", h_url, av_err2str(ret));
++    }
++    av_dict_free(&opt_dict);
++}
++
+ static int icecast_write(URLContext *h, const uint8_t *buf, int size)
+ {
+     IcecastContext *s = h->priv_data;
+@@ -202,6 +268,13 @@ static int icecast_write(URLContext *h, const uint8_t *buf, int size)
+             }
+         }
+     }
++    if (h->ctx && h->ctx->event_flags & AVFMT_EVENT_FLAG_METADATA_UPDATED) {
++        h->ctx->event_flags &= ~AVFMT_EVENT_FLAG_METADATA_UPDATED;
++        AVDictionaryEntry *song_entry = av_dict_get(h->ctx->metadata, "StreamTitle",  NULL, 0);
++        if (song_entry) {
++            update_metadata(s, song_entry->value);
++        }
++    }
+     return ffurl_write(s->hd, buf, size);
+ }
+ 
+diff --git a/libavformat/url.h b/libavformat/url.h
+index 3cfe3ecc5c..c5f13fbb59 100644
+--- a/libavformat/url.h
++++ b/libavformat/url.h
+@@ -33,6 +33,7 @@
+ #define URL_PROTOCOL_FLAG_NETWORK       2 /*< The protocol uses network */
+ 
+ extern const AVClass ffurl_context_class;
++typedef struct AVFormatContext AVFormatContext;
+ 
+ typedef struct URLContext {
+     const AVClass *av_class;    /**< information for av_log(). Set by url_open(). */
+@@ -48,6 +49,7 @@ typedef struct URLContext {
+     const char *protocol_whitelist;
+     const char *protocol_blacklist;
+     int min_packet_size;        /**< if non zero, the stream is packetized with this min packet size */
++    AVFormatContext *ctx;       /**< reference to the format context */
+ } URLContext;
+ 
+ typedef struct URLProtocol {
